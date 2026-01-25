@@ -1,233 +1,348 @@
 #!/usr/bin/env python3
 """
-Raspbian SD Card Configurator with Curses TUI
-Interactive configuration for raspi-config, WiFi, and user passwords
+Raspbian SD Card Configurator - n8n-style Node Workflow Engine
 """
 
 import curses
 import json
 import sys
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional, List, Callable
+import re
 import crypt
-from enum import Enum
+from pathlib import Path
+from typing import Any, Dict
 
 
-@dataclass
-class WifiConfig:
-    ssid: str = ""
-    password: str = ""
-    country: str = "US"
-    key_mgmt: str = "WPA-PSK"
+class WorkflowEngine:
+    """Execute n8n-style node workflows."""
+    
+    def __init__(self, schema_path: str, mount_path: str):
+        with open(schema_path) as f:
+            self.schema = json.load(f)
+        
+        self.mount_path = Path(mount_path)
+        self.vars = {}
+        self.node_outputs = {}  # Store outputs: {node_id: {output_name: value}}
+        self.mounts = {
+            name: str(self.mount_path / rel_path)
+            for name, rel_path in self.schema["mounts"].items()
+        }
+        
+        # Action dispatch table
+        self.actions = {
+            "file.write": self._file_write,
+            "file.read": self._file_read,
+            "file.touch": self._file_touch,
+            "text.replace": self._text_replace,
+            "text.filter_lines": self._text_filter_lines,
+            "text.append": self._text_append,
+            "text.template": self._text_template,
+            "text.sed": self._text_sed,
+            "crypto.sha512": self._crypto_sha512,
+            "preset.apply": self._preset_apply,
+        }
+    
+    def substitute(self, text: str) -> str:
+        """Substitute {var}, {mount.name}, and {{node.output}}."""
+        result = text
+        
+        # Substitute variables
+        for key, val in self.vars.items():
+            result = result.replace(f"{{{key}}}", str(val) if val else "")
+        
+        # Substitute mounts
+        for name, path in self.mounts.items():
+            result = result.replace(f"{{mount.{name}}}", path)
+        
+        # Substitute node outputs: {{node_id.output}}
+        for node_id, outputs in self.node_outputs.items():
+            for output_name, value in outputs.items():
+                result = result.replace(f"{{{{{node_id}.{output_name}}}}}", str(value) if value else "")
+        
+        return result
+    
+    def execute(self, field_values: Dict[str, Any]) -> tuple[bool, str]:
+        """Execute nodes following connection graph order."""
+        try:
+            self.vars.update(field_values)
+            
+            nodes_list = self.schema["nodes"]
+            nodes_by_id = {node["id"]: node for node in nodes_list}
+            connections = self.schema.get("connections", {})
+            
+            # Build reverse dependency graph: node -> nodes that depend on it
+            # and forward dependency graph: node -> nodes it depends on
+            depends_on = {}  # node_id -> [node_ids it needs]
+            depended_by = {}  # node_id -> [node_ids that need it]
+            
+            for node in nodes_list:
+                depends_on[node["id"]] = []
+                depended_by[node["id"]] = []
+            
+            # Parse connections: from_node.output -> to_node.input
+            for from_node_id, conn_map in connections.items():
+                if from_node_id not in depends_on:
+                    depends_on[from_node_id] = []
+                    depended_by[from_node_id] = []
+                
+                for output_type, output_idx_map in conn_map.items():
+                    for output_idx, targets in output_idx_map.items():
+                        for target in targets:
+                            to_node_id = target["node"]
+                            if to_node_id not in depends_on:
+                                depends_on[to_node_id] = []
+                                depended_by[to_node_id] = []
+                            
+                            depends_on[to_node_id].append(from_node_id)
+                            depended_by[from_node_id].append(to_node_id)
+            
+            # Find root nodes (no dependencies)
+            root_nodes = [n["id"] for n in nodes_list if not depends_on[n["id"]]]
+            
+            executed = set()
+            execution_order = []
+            
+            def topological_sort(node_id: str):
+                """Depth-first traversal to build execution order."""
+                if node_id in executed:
+                    return
+                
+                # Execute dependencies first
+                for dep in depends_on.get(node_id, []):
+                    topological_sort(dep)
+                
+                execution_order.append(node_id)
+                executed.add(node_id)
+            
+            # Build execution order from roots
+            for root in root_nodes:
+                topological_sort(root)
+            
+            # Also traverse from non-root nodes that aren't reached
+            for node in nodes_list:
+                topological_sort(node["id"])
+            
+            # Now execute in order
+            for node_id in execution_order:
+                node = nodes_by_id[node_id]
+                params = node.get("parameters", {})
+                
+                # Check condition
+                if "condition" in params:
+                    if not self._eval_condition(params["condition"]):
+                        continue
+                
+                # Execute node
+                action = node.get("type")
+                if action not in self.actions:
+                    raise ValueError(f"Unknown action: {action}")
+                
+                # Resolve parameters with substitution (includes node outputs)
+                resolved_params = {
+                    k: self.substitute(str(v)) 
+                    for k, v in params.items() 
+                    if k != "condition"
+                }
+                
+                # Execute action
+                outputs = self.actions[action](resolved_params)
+                
+                # Store outputs under node.data.outputname format
+                if outputs:
+                    self.node_outputs[f"{node_id}.data"] = outputs
+            
+            meta = self.schema.get("meta", {})
+            msg = meta.get("strings", {}).get("apply_success", "Success")
+            return True, msg
+        
+        except Exception as e:
+            meta = self.schema.get("meta", {})
+            msg_template = meta.get("strings", {}).get("apply_error", "Error: {error}")
+            return False, msg_template.format(error=str(e))
+    
+    def _eval_condition(self, condition: str) -> bool:
+        """Evaluate boolean condition."""
+        condition = self.substitute(condition)
+        try:
+            return bool(eval(condition, {"__builtins__": {}}, {}))
+        except:
+            return False
+    
+    # Action handlers - return dict of outputs
+    def _file_write(self, params: Dict) -> Dict:
+        path = Path(params["path"])
+        content = params["content"]
+        path.write_text(content)
+        if "chmod" in params:
+            path.chmod(int(params["chmod"], 8))
+        return {}
+    
+    def _file_read(self, params: Dict) -> Dict:
+        path = Path(params["path"])
+        return {"content": path.read_text()}
+    
+    def _file_touch(self, params: Dict) -> Dict:
+        Path(params["path"]).touch()
+        return {}
+    
+    def _text_replace(self, params: Dict) -> Dict:
+        text = params["text"]
+        result = text.replace(params["find"], params["replace"])
+        return {"result": result}
+    
+    def _text_filter_lines(self, params: Dict) -> Dict:
+        text = params["text"]
+        lines = text.split('\n')
+        for pattern in params.get("exclude", []):
+            lines = [l for l in lines if not re.match(pattern, l)]
+        return {"result": '\n'.join(lines)}
+    
+    def _text_append(self, params: Dict) -> Dict:
+        text = params["text"]
+        line = params["line"]
+        result = (text + '\n' + line) if text else line
+        return {"result": result}
+    
+    def _text_template(self, params: Dict) -> Dict:
+        template = self.schema["templates"][params["template"]]
+        result = template
+        for key, val in params.get("vars", {}).items():
+            result = result.replace(f"{{{key}}}", val)
+        return {"result": result}
+    
+    def _text_sed(self, params: Dict) -> Dict:
+        text = params["text"]
+        pattern = params["pattern"]
+        replacement = params["replacement"]
+        lines = text.split('\n')
+        result_lines = [
+            re.sub(pattern, replacement, line) if re.search(pattern, line) else line
+            for line in lines
+        ]
+        return {"result": '\n'.join(result_lines)}
+    
+    def _crypto_sha512(self, params: Dict) -> Dict:
+        password = params["password"]
+        return {"hash": crypt.crypt(password, crypt.METHOD_SHA512)}
+    
+    def _preset_apply(self, params: Dict) -> Dict:
+        text = params["text"]
+        preset_name = params["preset"]
+        preset_data = self.schema["presets"][preset_name]
+        lines = text.split('\n') if text else []
+        for key, val in preset_data.items():
+            lines.append(f"{key}={val}")
+        return {"result": '\n'.join(lines)}
 
 
-@dataclass
-class UserConfig:
-    username: str = ""
-    password: str = ""
-    enable_sudo: bool = True
-
-
-@dataclass
-class RaspianConfig:
-    hostname: str = ""
-    enable_ssh: bool = True
-    gpu_mem: Optional[int] = None
-    overclock: Optional[str] = None
-    wifi: WifiConfig = field(default_factory=WifiConfig)
-    users: List[UserConfig] = field(default_factory=list)
-
-
-class InputMode(Enum):
-    NORMAL = 1
-    INPUT = 2
-    CONFIRM = 3
+class WorkflowGraphBuilder:
+    """Build a visual representation of the workflow."""
+    
+    @staticmethod
+    def find_dependencies(nodes_list: list, connections: dict) -> dict:
+        """Find which nodes depend on which (from n8n connections)."""
+        node_deps = {}
+        for node in nodes_list:
+            node_deps[node["id"]] = []
+        
+        for from_node, conn_map in connections.items():
+            for output_type, output_idx_map in conn_map.items():
+                for output_idx, targets in output_idx_map.items():
+                    for target in targets:
+                        to_node = target["node"]
+                        if to_node not in node_deps:
+                            node_deps[to_node] = []
+                        node_deps[to_node].append(from_node)
+        
+        return node_deps
+    
+    @staticmethod
+    def draw_graph(stdscr, nodes_list: list, connections: dict, y_start: int):
+        """Draw workflow graph visualization."""
+        h, w = stdscr.getmaxyx()
+        node_deps = WorkflowGraphBuilder.find_dependencies(nodes_list, connections)
+        
+        y = y_start
+        for node in nodes_list:
+            if y >= h - 3:
+                stdscr.addstr(y, 0, "  ... (more nodes)")
+                break
+            
+            node_id = node["id"]
+            node_type = node.get("type", "unknown")
+            params = node.get("parameters", {})
+            condition = f" [if: {params.get('condition', 'always')}]" if "condition" in params else ""
+            
+            line = f"  ◆ {node_id}: {node_type}{condition}"[:w-2]
+            stdscr.addstr(y, 0, line)
+            y += 1
+            
+            deps = node_deps.get(node_id, [])
+            if deps:
+                for dep in deps:
+                    line = f"    ← {dep}"[:w-2]
+                    stdscr.addstr(y, 0, line)
+                    y += 1
 
 
 class RaspianConfiguratorTUI:
-    def __init__(self, mount_path: str):
-        self.mount_path = Path(mount_path)
-        self.boot_path = self.mount_path / "boot"
-        self.rootfs_path = self.mount_path / "rootfs"
+    """Curses TUI."""
+    
+    def __init__(self, schema_path: str, mount_path: str):
+        with open(schema_path) as f:
+            self.schema = json.load(f)
         
-        self.config = RaspianConfig()
-        self.mode = InputMode.NORMAL
+        self.engine = WorkflowEngine(schema_path, mount_path)
+        self.config = {}
         self.current_field = 0
         self.input_buffer = ""
-        self.selected_user = 0
         self.message = ""
-        self.message_type = "info"  # "info", "error", "success"
+        self.message_type = "info"
+        self.view_mode = "config"  # "config" or "workflow"
         
-        self.fields = [
-            ("Hostname", "hostname", str),
-            ("Enable SSH", "enable_ssh", bool),
-            ("GPU Memory (MB)", "gpu_mem", int),
-            ("Overclock", "overclock", str),
-            ("WiFi SSID", "wifi.ssid", str),
-            ("WiFi Password", "wifi.password", str),
-            ("WiFi Country", "wifi.country", str),
-            ("Pi Username", "user_username", str),
-            ("Pi Password", "user_password", str),
-        ]
+        # Get fields from meta (n8n style)
+        meta = self.schema.get("meta", {})
+        fields = meta.get("fields", [])
+        for field in fields:
+            self.config[field["id"]] = field.get("default")
     
-    def get_field_value(self, field_name: str):
-        """Get value from config using dot notation."""
-        if '.' in field_name:
-            obj_name, attr_name = field_name.split('.')
-            obj = getattr(self.config, obj_name)
-            return getattr(obj, attr_name)
-        else:
-            return getattr(self.config, field_name)
-    
-    def set_field_value(self, field_name: str, value):
-        """Set value in config using dot notation."""
-        if '.' in field_name:
-            obj_name, attr_name = field_name.split('.')
-            obj = getattr(self.config, obj_name)
-            setattr(obj, attr_name, value)
-        else:
-            setattr(self.config, field_name, value)
-    
-    def validate_mount_path(self) -> bool:
-        """Check if mount path is valid."""
-        if not self.boot_path.exists() or not self.rootfs_path.exists():
-            self.set_message(
-                f"Invalid mount path. Need 'boot' and 'rootfs' directories",
-                "error"
-            )
+    def validate_mount(self) -> bool:
+        meta = self.schema.get("meta", {})
+        mounts = meta.get("mounts", {})
+        boot = self.engine.mount_path / mounts.get("boot", "boot")
+        rootfs = self.engine.mount_path / mounts.get("rootfs", "rootfs")
+        if not boot.exists() or not rootfs.exists():
+            self.message = self.schema["strings"]["invalid_mount"]
+            self.message_type = "error"
             return False
         return True
     
-    def set_message(self, msg: str, msg_type: str = "info"):
-        """Set status message."""
-        self.message = msg
-        self.message_type = msg_type
+    def validate(self, field: Dict, value: Any) -> tuple[bool, str]:
+        for rule in field.get("validate", []):
+            if rule["type"] == "pattern":
+                if not re.match(rule["pattern"], str(value)):
+                    return False, "Invalid format"
+            elif rule["type"] == "length":
+                if len(str(value)) < rule["min"]:
+                    return False, "Too short"
+        return True, ""
     
-    def apply_configuration(self) -> bool:
-        """Apply all configuration to SD card."""
-        try:
-            if self.config.hostname:
-                self._set_hostname(self.config.hostname)
-            
-            if self.config.enable_ssh:
-                self._enable_ssh()
-            
-            if self.config.gpu_mem:
-                self._set_gpu_memory(self.config.gpu_mem)
-            
-            if self.config.overclock:
-                self._set_overclock(self.config.overclock)
-            
-            if self.config.wifi.ssid:
-                self._configure_wifi(self.config.wifi)
-            
-            if self.config.users:
-                for user in self.config.users:
-                    if user.username and user.password:
-                        self._configure_user(user)
-            
-            self.set_message("Configuration applied successfully!", "success")
-            return True
-        except Exception as e:
-            self.set_message(f"Error: {str(e)}", "error")
-            return False
-    
-    def _set_hostname(self, hostname: str) -> None:
-        hostname_file = self.rootfs_path / "etc" / "hostname"
-        hostname_file.write_text(f"{hostname}\n")
-        
-        hosts_file = self.rootfs_path / "etc" / "hosts"
-        content = hosts_file.read_text()
-        content = content.replace("raspberrypi", hostname)
-        hosts_file.write_text(content)
-    
-    def _enable_ssh(self) -> None:
-        ssh_file = self.boot_path / "ssh"
-        ssh_file.touch()
-    
-    def _set_gpu_memory(self, gpu_mem: int) -> None:
-        config_file = self.boot_path / "config.txt"
-        content = config_file.read_text()
-        lines = [line for line in content.split('\n') if not line.startswith('gpu_mem')]
-        lines.append(f"gpu_mem={gpu_mem}")
-        config_file.write_text('\n'.join(lines))
-    
-    def _set_overclock(self, preset: str) -> None:
-        presets = {
-            'modest': {'arm_freq': 1900, 'gpu_freq': 600, 'over_voltage': 2},
-            'medium': {'arm_freq': 2000, 'gpu_freq': 650, 'over_voltage': 4},
-            'high': {'arm_freq': 2147, 'gpu_freq': 750, 'over_voltage': 6},
-        }
-        
-        if preset not in presets:
-            raise ValueError(f"Unknown preset: {preset}")
-        
-        config_file = self.boot_path / "config.txt"
-        content = config_file.read_text()
-        lines = [
-            line for line in content.split('\n')
-            if not any(key in line for key in presets[preset].keys())
-        ]
-        
-        for key, value in presets[preset].items():
-            lines.append(f"{key}={value}")
-        
-        config_file.write_text('\n'.join(lines))
-    
-    def _configure_wifi(self, wifi: WifiConfig) -> None:
-        wpa_supplicant_file = self.rootfs_path / "etc" / "wpa_supplicant" / "wpa_supplicant.conf"
-        content = f"""ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
-update_config=1
-country={wifi.country}
-
-network={{
-    ssid="{wifi.ssid}"
-    psk="{wifi.password}"
-    key_mgmt={wifi.key_mgmt}
-}}
-"""
-        wpa_supplicant_file.write_text(content)
-    
-    def _configure_user(self, user: UserConfig) -> None:
-        shadow_file = self.rootfs_path / "etc" / "shadow"
-        
-        if not shadow_file.exists():
-            raise FileNotFoundError(f"Shadow file not found")
-        
-        password_hash = crypt.crypt(user.password, crypt.METHOD_SHA512)
-        
-        content = shadow_file.read_text()
-        lines = content.split('\n')
-        
-        user_found = False
-        for i, line in enumerate(lines):
-            if line.startswith(f"{user.username}:"):
-                parts = line.split(':')
-                parts[1] = password_hash
-                lines[i] = ':'.join(parts)
-                user_found = True
-                break
-        
-        if not user_found:
-            raise ValueError(f"User '{user.username}' not found")
-        
-        shadow_file.write_text('\n'.join(lines))
-        shadow_file.chmod(0o000)
+    def apply(self) -> bool:
+        success, message = self.engine.execute(self.config)
+        self.message = message
+        self.message_type = "success" if success else "error"
+        return success
     
     def run(self, stdscr):
-        """Main TUI loop."""
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.timeout(100)
         
-        # Color pairs
-        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)  # Selected
-        curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)    # Error
-        curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)  # Success
-        curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)   # Info
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_WHITE)
+        curses.init_pair(2, curses.COLOR_RED, curses.COLOR_BLACK)
+        curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)
+        curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
         
-        if not self.validate_mount_path():
+        if not self.validate_mount():
             stdscr.clear()
             stdscr.addstr(0, 0, self.message, curses.color_pair(2))
             stdscr.refresh()
@@ -236,130 +351,125 @@ network={{
         
         while True:
             stdscr.clear()
-            height, width = stdscr.getmaxyx()
+            h, w = stdscr.getmaxyx()
             
-            # Header
-            stdscr.addstr(0, 0, "Raspbian SD Card Configurator", curses.A_BOLD)
-            stdscr.addstr(1, 0, "─" * width)
+            title = self.schema["metadata"]["name"]
+            mode_label = " [WORKFLOW]" if self.view_mode == "workflow" else " [CONFIG]"
+            stdscr.addstr(0, 0, title + mode_label, curses.A_BOLD)
+            stdscr.addstr(1, 0, "─" * w)
             
-            # Status message
             if self.message:
-                color_pair = {
-                    "error": 2,
-                    "success": 3,
-                    "info": 4
-                }.get(self.message_type, 4)
-                stdscr.addstr(2, 0, self.message, curses.color_pair(color_pair))
+                color = {"error": 2, "success": 3, "info": 4}.get(self.message_type, 4)
+                stdscr.addstr(2, 0, self.message[:w-1], curses.color_pair(color))
                 self.message = ""
             
-            # Fields display
-            y = 4
-            for i, (label, field_name, field_type) in enumerate(self.fields):
-                value = self.get_field_value(field_name)
-                
-                # Format value for display
-                if isinstance(value, bool):
-                    display_value = "Yes" if value else "No"
-                elif value is None:
-                    display_value = "(empty)"
-                else:
-                    display_value = str(value)
-                
-                # Highlight selected field
-                if i == self.current_field:
-                    stdscr.addstr(y, 0, f"> {label}: {display_value}", curses.color_pair(1))
-                else:
-                    stdscr.addstr(y, 0, f"  {label}: {display_value}")
-                
-                y += 1
-                if y >= height - 4:
-                    break
+            if self.view_mode == "config":
+                meta = self.schema.get("meta", {})
+                fields = meta.get("fields", [])
+                y = 4
+                for i, field in enumerate(fields):
+                    if y >= h - 4:
+                        break
+                    fid = field["id"]
+                    val = self.config.get(fid)
+                    
+                    if field["type"] == "bool":
+                        disp = "Yes" if val else "No"
+                    elif field["type"] == "password":
+                        disp = "●" * min(len(str(val)), 8) if val else "(empty)"
+                    elif val is None or val == "":
+                        disp = "(empty)"
+                    else:
+                        disp = str(val)
+                    
+                    line = f"> {field['label']}: {disp}" if i == self.current_field else f"  {field['label']}: {disp}"
+                    color = curses.color_pair(1) if i == self.current_field else 0
+                    stdscr.addstr(y, 0, line, color)
+                    y += 1
+            else:
+                stdscr.addstr(3, 0, "Workflow Graph:", curses.A_DIM)
+                WorkflowGraphBuilder.draw_graph(stdscr, self.schema["nodes"], self.schema.get("connections", {}), 4)
             
-            # Footer
-            stdscr.addstr(height - 3, 0, "─" * width)
-            stdscr.addstr(height - 2, 0, 
-                         "↑/↓: Navigate | Enter: Edit | Space: Toggle | Ctrl+S: Save | Ctrl+Q: Quit")
-            stdscr.addstr(height - 1, 0, f"Mount: {self.mount_path}")
-            
+            stdscr.addstr(h - 3, 0, "─" * w)
+            footer = "Tab: Toggle View | " + self.schema["strings"]["nav_help"]
+            stdscr.addstr(h - 2, 0, footer[:w-1])
+            stdscr.addstr(h - 1, 0, f"Mount: {self.engine.mount_path}")
             stdscr.refresh()
             
-            # Input handling
             try:
                 key = stdscr.getch()
-                
-                if key == -1:  # No input
+                if key == -1:
                     continue
-                
-                elif key == ord('q') or key == 3:  # Ctrl+C
+                elif key == ord('q') or key == 3:
                     break
-                
-                elif key == ord('s') or key == 19:  # Ctrl+S
-                    if self.apply_configuration():
-                        stdscr.getch()  # Wait for user to see success
-                
-                elif key == curses.KEY_UP:
-                    self.current_field = max(0, self.current_field - 1)
-                
-                elif key == curses.KEY_DOWN:
-                    self.current_field = min(len(self.fields) - 1, self.current_field + 1)
-                
-                elif key == ord('\n'):  # Enter
-                    self._enter_edit_mode(stdscr)
-                
-                elif key == ord(' '):  # Space - toggle boolean
-                    field_name = self.fields[self.current_field][1]
-                    field_type = self.fields[self.current_field][2]
-                    if field_type == bool:
-                        current = self.get_field_value(field_name)
-                        self.set_field_value(field_name, not current)
-            
+                elif key == ord('\t'):
+                    self.view_mode = "workflow" if self.view_mode == "config" else "config"
+                elif key == ord('s') or key == 19:
+                    self.apply()
+                    stdscr.getch()
+                elif self.view_mode == "config":
+                    meta = self.schema.get("meta", {})
+                    fields = meta.get("fields", [])
+                    if key == curses.KEY_UP:
+                        self.current_field = max(0, self.current_field - 1)
+                    elif key == curses.KEY_DOWN:
+                        self.current_field = min(len(fields) - 1, self.current_field + 1)
+                    elif key == ord('\n'):
+                        self._edit_field(stdscr)
+                    elif key == ord(' '):
+                        field = fields[self.current_field]
+                        if field["type"] == "bool":
+                            self.config[field["id"]] = not self.config[field["id"]]
             except KeyboardInterrupt:
                 break
     
-    def _enter_edit_mode(self, stdscr):
-        """Enter edit mode for current field."""
-        label, field_name, field_type = self.fields[self.current_field]
-        current_value = self.get_field_value(field_name)
-        
-        height, width = stdscr.getmaxyx()
-        input_y = height - 4
+    def _edit_field(self, stdscr):
+        meta = self.schema.get("meta", {})
+        fields = meta.get("fields", [])
+        field = fields[self.current_field]
+        fid = field["id"]
+        h, w = stdscr.getmaxyx()
+        iy = h - 4
         
         curses.curs_set(1)
-        self.input_buffer = str(current_value) if current_value else ""
+        self.input_buffer = str(self.config.get(fid, "")) if self.config.get(fid) else ""
         
         while True:
-            stdscr.addstr(input_y, 0, " " * width)
-            prompt = f"{label}: "
-            stdscr.addstr(input_y, 0, prompt + self.input_buffer)
+            stdscr.addstr(iy, 0, " " * w)
+            prompt = f"{field['label']}: "
+            disp = "●" * len(self.input_buffer) if field["type"] == "password" else self.input_buffer
+            stdscr.addstr(iy, 0, prompt + disp)
             stdscr.refresh()
             
             try:
                 key = stdscr.getch()
-                
-                if key == ord('\n'):  # Confirm
+                if key == ord('\n'):
                     try:
-                        if field_type == bool:
-                            value = self.input_buffer.lower() in ('y', 'yes', '1', 'true')
-                        elif field_type == int:
-                            value = int(self.input_buffer) if self.input_buffer else None
+                        if field["type"] == "bool":
+                            val = self.input_buffer.lower() in ('y', 'yes', '1', 'true')
+                        elif field["type"] == "int":
+                            val = int(self.input_buffer) if self.input_buffer else None
                         else:
-                            value = self.input_buffer
+                            val = self.input_buffer
                         
-                        self.set_field_value(field_name, value)
-                        self.set_message(f"{label} updated", "success")
+                        ok, err = self.validate(field, val)
+                        if not ok:
+                            self.message = err
+                            self.message_type = "error"
+                        else:
+                            self.config[fid] = val
+                            self.message = f"{field['label']} updated"
+                            self.message_type = "success"
                     except ValueError:
-                        self.set_message(f"Invalid {field_type.__name__} value", "error")
+                        self.message = f"Invalid {field['type']}"
+                        self.message_type = "error"
                     break
-                
-                elif key == 27:  # ESC - cancel
+                elif key == 27:
                     break
-                
                 elif key == curses.KEY_BACKSPACE or key == 127:
                     self.input_buffer = self.input_buffer[:-1]
-                
-                elif 32 <= key <= 126:  # Printable characters
+                elif 32 <= key <= 126:
                     self.input_buffer += chr(key)
-            
             except KeyboardInterrupt:
                 break
         
@@ -368,12 +478,12 @@ network={{
 
 def main():
     import argparse
-    
-    parser = argparse.ArgumentParser(description="Raspbian SD Card Configurator (TUI)")
-    parser.add_argument("mount_path", help="Path to mounted Raspbian SD card root")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mount_path")
+    parser.add_argument("-c", "--config", default="config.json")
     args = parser.parse_args()
     
-    tui = RaspianConfiguratorTUI(args.mount_path)
+    tui = RaspianConfiguratorTUI(args.config, args.mount_path)
     curses.wrapper(tui.run)
 
 
