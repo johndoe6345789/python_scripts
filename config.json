@@ -1,0 +1,804 @@
+{
+  "name": "Raspbian SD Card Configuration",
+  "active": true,
+  "nodes": [
+    {
+      "id": "hostname_write",
+      "name": "Write Hostname",
+      "type": "file.write",
+      "typeVersion": 1,
+      "position": [100, 100],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.rootfs}/etc/hostname",
+        "content": "{hostname}\n",
+        "condition": "{hostname}"
+      }
+    },
+    {
+      "id": "hosts_read",
+      "name": "Read /etc/hosts",
+      "type": "file.read",
+      "typeVersion": 1,
+      "position": [100, 200],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.rootfs}/etc/hosts",
+        "condition": "{hostname}"
+      }
+    },
+    {
+      "id": "hosts_replace",
+      "name": "Replace hostname in hosts",
+      "type": "text.replace",
+      "typeVersion": 1,
+      "position": [300, 200],
+      "disabled": false,
+      "parameters": {
+        "text": "{{hosts_read.data.content}}",
+        "find": "raspberrypi",
+        "replace": "{hostname}"
+      }
+    },
+    {
+      "id": "hosts_write",
+      "name": "Write /etc/hosts",
+      "type": "file.write",
+      "typeVersion": 1,
+      "position": [500, 200],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.rootfs}/etc/hosts",
+        "content": "{{hosts_replace.data.result}}",
+        "condition": "{hostname}"
+      }
+    },
+    {
+      "id": "ssh_enable",
+      "name": "Enable SSH",
+      "type": "file.touch",
+      "typeVersion": 1,
+      "position": [100, 300],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.boot}/ssh",
+        "condition": "{enable_ssh}"
+      }
+    },
+    {
+      "id": "gpu_config_read",
+      "name": "Read config.txt",
+      "type": "file.read",
+      "typeVersion": 1,
+      "position": [100, 400],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.boot}/config.txt",
+        "condition": "{gpu_mem}"
+      }
+    },
+    {
+      "id": "gpu_filter",
+      "name": "Filter GPU lines",
+      "type": "text.filter_lines",
+      "typeVersion": 1,
+      "position": [300, 400],
+      "disabled": false,
+      "parameters": {
+        "text": "{{gpu_config_read.data.content}}",
+        "exclude": ["^gpu_mem"],
+        "condition": "{gpu_mem}"
+      }
+    },
+    {
+      "id": "gpu_append",
+      "name": "Append GPU setting",
+      "type": "text.append",
+      "typeVersion": 1,
+      "position": [500, 400],
+      "disabled": false,
+      "parameters": {
+        "text": "{{gpu_filter.data.result}}",
+        "line": "gpu_mem={gpu_mem}",
+        "condition": "{gpu_mem}"
+      }
+    },
+    {
+      "id": "gpu_config_write",
+      "name": "Write config.txt",
+      "type": "file.write",
+      "typeVersion": 1,
+      "position": [700, 400],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.boot}/config.txt",
+        "content": "{{gpu_append.data.result}}",
+        "condition": "{gpu_mem}"
+      }
+    },
+    {
+      "id": "oc_config_read",
+      "name": "Read config.txt (overclock)",
+      "type": "file.read",
+      "typeVersion": 1,
+      "position": [100, 500],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.boot}/config.txt",
+        "condition": "{overclock} != 'none'"
+      }
+    },
+    {
+      "id": "oc_filter",
+      "name": "Filter overclock lines",
+      "type": "text.filter_lines",
+      "typeVersion": 1,
+      "position": [300, 500],
+      "disabled": false,
+      "parameters": {
+        "text": "{{oc_config_read.data.content}}",
+        "exclude": ["^arm_freq", "^gpu_freq", "^over_voltage"],
+        "condition": "{overclock} != 'none'"
+      }
+    },
+    {
+      "id": "oc_preset_apply",
+      "name": "Apply overclock preset",
+      "type": "preset.apply",
+      "typeVersion": 1,
+      "position": [500, 500],
+      "disabled": false,
+      "parameters": {
+        "text": "{{oc_filter.data.result}}",
+        "preset": "{overclock}",
+        "condition": "{overclock} != 'none'"
+      }
+    },
+    {
+      "id": "oc_config_write",
+      "name": "Write config.txt (overclock)",
+      "type": "file.write",
+      "typeVersion": 1,
+      "position": [700, 500],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.boot}/config.txt",
+        "content": "{{oc_preset_apply.data.result}}",
+        "condition": "{overclock} != 'none'"
+      }
+    },
+    {
+      "id": "wifi_template",
+      "name": "Generate WiFi config",
+      "type": "text.template",
+      "typeVersion": 1,
+      "position": [100, 600],
+      "disabled": false,
+      "parameters": {
+        "template": "wpa_supplicant",
+        "vars": {
+          "ssid": "{wifi_ssid}",
+          "password": "{wifi_password}",
+          "country": "{wifi_country}"
+        },
+        "condition": "{wifi_ssid} && {wifi_password}"
+      }
+    },
+    {
+      "id": "wifi_write",
+      "name": "Write WiFi config",
+      "type": "file.write",
+      "typeVersion": 1,
+      "position": [300, 600],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.rootfs}/etc/wpa_supplicant/wpa_supplicant.conf",
+        "content": "{{wifi_template.data.result}}",
+        "condition": "{wifi_ssid} && {wifi_password}"
+      }
+    },
+    {
+      "id": "shadow_read",
+      "name": "Read shadow file",
+      "type": "file.read",
+      "typeVersion": 1,
+      "position": [100, 700],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.rootfs}/etc/shadow",
+        "condition": "{user_username} && {user_password}"
+      }
+    },
+    {
+      "id": "password_hash",
+      "name": "Hash password",
+      "type": "crypto.sha512",
+      "typeVersion": 1,
+      "position": [300, 700],
+      "disabled": false,
+      "parameters": {
+        "password": "{user_password}",
+        "condition": "{user_username} && {user_password}"
+      }
+    },
+    {
+      "id": "shadow_update",
+      "name": "Update shadow entry",
+      "type": "text.sed",
+      "typeVersion": 1,
+      "position": [500, 700],
+      "disabled": false,
+      "parameters": {
+        "text": "{{shadow_read.data.content}}",
+        "pattern": "^{user_username}:([^:]*)",
+        "replacement": "{user_username}:{{password_hash.data.hash}}",
+        "condition": "{user_username} && {user_password}"
+      }
+    },
+    {
+      "id": "shadow_write",
+      "name": "Write shadow file",
+      "type": "file.write",
+      "typeVersion": 1,
+      "position": [700, 700],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.rootfs}/etc/shadow",
+        "content": "{{shadow_update.data.result}}",
+        "chmod": "0o000",
+        "condition": "{user_username} && {user_password}"
+      }
+    },
+    {
+      "id": "configuration_complete",
+      "name": "Configuration Complete",
+      "type": "noop",
+      "typeVersion": 1,
+      "position": [800, 350],
+      "disabled": false,
+      "parameters": {}
+    },
+    {
+      "id": "error_handler",
+      "name": "Handle Errors",
+      "type": "noop",
+      "typeVersion": 1,
+      "position": [800, 550],
+      "disabled": false,
+      "parameters": {}
+    },
+    {
+      "id": "verify_hostname",
+      "name": "Verify Hostname Applied",
+      "type": "file.read",
+      "typeVersion": 1,
+      "position": [1000, 100],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.rootfs}/etc/hostname",
+        "condition": "{hostname}"
+      }
+    },
+    {
+      "id": "verify_wifi",
+      "name": "Verify WiFi Config",
+      "type": "file.read",
+      "typeVersion": 1,
+      "position": [1000, 600],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.rootfs}/etc/wpa_supplicant/wpa_supplicant.conf",
+        "condition": "{wifi_ssid} && {wifi_password}"
+      }
+    },
+    {
+      "id": "verify_shadow",
+      "name": "Verify Shadow Updated",
+      "type": "file.read",
+      "typeVersion": 1,
+      "position": [1000, 700],
+      "disabled": false,
+      "parameters": {
+        "path": "{mount.rootfs}/etc/shadow",
+        "condition": "{user_username} && {user_password}"
+      }
+    },
+    {
+      "id": "success_notification",
+      "name": "All Verified ✓",
+      "type": "noop",
+      "typeVersion": 1,
+      "position": [1200, 400],
+      "disabled": false,
+      "parameters": {}
+    },
+    {
+      "id": "failure_notification",
+      "name": "Verification Failed ✗",
+      "type": "noop",
+      "typeVersion": 1,
+      "position": [1200, 600],
+      "disabled": false,
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "hostname_write": {
+      "main": {
+        "0": [
+          {
+            "node": "configuration_complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "error_handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      }
+    },
+    "hosts_read": {
+      "main": {
+        "0": [
+          {
+            "node": "hosts_replace",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "error_handler",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      }
+    },
+    "hosts_replace": {
+      "main": {
+        "0": [
+          {
+            "node": "hosts_write",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "error_handler",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      }
+    },
+    "hosts_write": {
+      "main": {
+        "0": [
+          {
+            "node": "configuration_complete",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "error_handler",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      }
+    },
+    "ssh_enable": {
+      "main": {
+        "0": [
+          {
+            "node": "configuration_complete",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "error_handler",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      }
+    },
+    "gpu_config_read": {
+      "main": {
+        "0": [
+          {
+            "node": "gpu_filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "error_handler",
+            "type": "main",
+            "index": 5
+          }
+        ]
+      }
+    },
+    "gpu_filter": {
+      "main": {
+        "0": [
+          {
+            "node": "gpu_append",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      }
+    },
+    "gpu_append": {
+      "main": {
+        "0": [
+          {
+            "node": "gpu_config_write",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      }
+    },
+    "gpu_config_write": {
+      "main": {
+        "0": [
+          {
+            "node": "configuration_complete",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "error_handler",
+            "type": "main",
+            "index": 6
+          }
+        ]
+      }
+    },
+    "oc_config_read": {
+      "main": {
+        "0": [
+          {
+            "node": "oc_filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "error_handler",
+            "type": "main",
+            "index": 7
+          }
+        ]
+      }
+    },
+    "oc_filter": {
+      "main": {
+        "0": [
+          {
+            "node": "oc_preset_apply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      }
+    },
+    "oc_preset_apply": {
+      "main": {
+        "0": [
+          {
+            "node": "oc_config_write",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      }
+    },
+    "oc_config_write": {
+      "main": {
+        "0": [
+          {
+            "node": "configuration_complete",
+            "type": "main",
+            "index": 4
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "error_handler",
+            "type": "main",
+            "index": 8
+          }
+        ]
+      }
+    },
+    "wifi_template": {
+      "main": {
+        "0": [
+          {
+            "node": "wifi_write",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      }
+    },
+    "wifi_write": {
+      "main": {
+        "0": [
+          {
+            "node": "configuration_complete",
+            "type": "main",
+            "index": 5
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "error_handler",
+            "type": "main",
+            "index": 9
+          }
+        ]
+      }
+    },
+    "shadow_read": {
+      "main": {
+        "0": [
+          {
+            "node": "shadow_update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "error_handler",
+            "type": "main",
+            "index": 10
+          }
+        ]
+      }
+    },
+    "password_hash": {
+      "main": {
+        "0": [
+          {
+            "node": "shadow_update",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      }
+    },
+    "shadow_update": {
+      "main": {
+        "0": [
+          {
+            "node": "shadow_write",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      }
+    },
+    "shadow_write": {
+      "main": {
+        "0": [
+          {
+            "node": "configuration_complete",
+            "type": "main",
+            "index": 6
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "error_handler",
+            "type": "main",
+            "index": 11
+          }
+        ]
+      }
+    },
+    "configuration_complete": {
+      "main": {
+        "0": [
+          {
+            "node": "verify_hostname",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "verify_wifi",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "verify_shadow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      }
+    },
+    "verify_hostname": {
+      "main": {
+        "0": [
+          {
+            "node": "success_notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "failure_notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      }
+    },
+    "verify_wifi": {
+      "main": {
+        "0": [
+          {
+            "node": "success_notification",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "failure_notification",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      }
+    },
+    "verify_shadow": {
+      "main": {
+        "0": [
+          {
+            "node": "success_notification",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      },
+      "error": {
+        "0": [
+          {
+            "node": "failure_notification",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      }
+    }
+  },
+  "settings": {},
+  "meta": {
+    "mounts": {
+      "boot": "boot",
+      "rootfs": "rootfs"
+    },
+    "fields": [
+      {
+        "id": "hostname",
+        "label": "Hostname",
+        "type": "string",
+        "default": "raspberrypi",
+        "validate": [{"type": "pattern", "pattern": "^[a-zA-Z0-9-]+$"}]
+      },
+      {
+        "id": "enable_ssh",
+        "label": "Enable SSH",
+        "type": "bool",
+        "default": true
+      },
+      {
+        "id": "gpu_mem",
+        "label": "GPU Memory (MB)",
+        "type": "int",
+        "default": null
+      },
+      {
+        "id": "overclock",
+        "label": "Overclock Preset",
+        "type": "choice",
+        "default": "none"
+      },
+      {
+        "id": "wifi_ssid",
+        "label": "WiFi SSID",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "id": "wifi_password",
+        "label": "WiFi Password",
+        "type": "password",
+        "default": ""
+      },
+      {
+        "id": "wifi_country",
+        "label": "WiFi Country Code",
+        "type": "string",
+        "default": "US",
+        "validate": [{"type": "pattern", "pattern": "^[A-Z]{2}$"}]
+      },
+      {
+        "id": "user_username",
+        "label": "Pi Username",
+        "type": "string",
+        "default": "pi"
+      },
+      {
+        "id": "user_password",
+        "label": "Pi Password",
+        "type": "password",
+        "default": ""
+      }
+    ],
+    "presets": {
+      "modest": {"arm_freq": 1900, "gpu_freq": 600, "over_voltage": 2},
+      "medium": {"arm_freq": 2000, "gpu_freq": 650, "over_voltage": 4},
+      "high": {"arm_freq": 2147, "gpu_freq": 750, "over_voltage": 6}
+    },
+    "templates": {
+      "wpa_supplicant": "ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\nupdate_config=1\ncountry={country}\n\nnetwork={{\n    ssid=\"{ssid}\"\n    psk=\"{password}\"\n    key_mgmt=WPA-PSK\n}}\n"
+    },
+    "strings": {
+      "nav_help": "↑/↓: Navigate | Enter: Edit | Space: Toggle | Ctrl+S: Save | Ctrl+Q: Quit",
+      "apply_success": "Configuration applied successfully!",
+      "apply_error": "Configuration error: {error}",
+      "invalid_mount": "Invalid mount path. Need 'boot' and 'rootfs' directories"
+    }
+  }
+}
